@@ -1,5 +1,6 @@
-export type ContractStatus = 'draft' | 'review' | 'ready' | 'released' | 'frozen';
-export type ChangeKind =
+import { stableChecksum } from '../lib/utils';
+
+export type ContractStatus = 'draft' | 'review' | 'ready' | 'released' | 'frozen';export type ChangeKind =
   | 'field_added'
   | 'field_removed'
   | 'optionality_changed'
@@ -54,6 +55,37 @@ export interface ContractVersion {
   notes: string;
   changeIds: string[];
   openapi: string;
+  candidateId?: string;
+  changes?: ContractChange[];
+}
+
+export type CandidateStatus = 'ready' | 'stale' | 'frozen' | 'discarded';
+export type CandidateDriftKind = 'openapi' | 'changes' | 'exemptions';
+
+export interface ReleaseCandidate {
+  id: string;
+  version: string;
+  notes: string;
+  createdAt: string;
+  createdBy: string;
+  status: CandidateStatus;
+  /** 候选生成时门禁是否存在非阻断警告（不影响冻结） */
+  warningsCount: number;
+  /** 候选生成时工作副本 OpenAPI 的校验值，冻结版本沿用该值 */
+  openapiChecksum: string;
+  /** 工作副本整体指纹，用于判断候选是否已过期 */
+  workFingerprint: string;
+  /** 指纹中 OpenAPI 部分，用于定位漂移来源 */
+  openapiFingerprint: string;
+  /** 不可变的已确认变更快照 */
+  changes: ContractChange[];
+  /** 不可变的豁免快照 */
+  exemptions: Exemption[];
+  /** 不可变的接口定义快照，冻结时据此生成正式版本 */
+  openapi: string;
+  frozenVersionId?: string;
+  frozenAt?: string;
+  discardedAt?: string;
 }
 
 export interface ApiContract {
@@ -70,6 +102,7 @@ export interface ApiContract {
   consumers: ApiConsumer[];
   exemptions: Exemption[];
   versions: ContractVersion[];
+  candidates: ReleaseCandidate[];
 }
 
 export interface ReleaseIssue {
@@ -108,6 +141,19 @@ export const CONTRACT_STATUS_LABELS: Record<ContractStatus, string> = {
   ready: '待发布',
   released: '已发布',
   frozen: '已冻结',
+};
+
+export const CANDIDATE_STATUS_LABELS: Record<CandidateStatus, string> = {
+  ready: '候选有效',
+  stale: '已过期',
+  frozen: '已冻结',
+  discarded: '已废弃',
+};
+
+export const CANDIDATE_DRIFT_LABELS: Record<CandidateDriftKind, string> = {
+  openapi: '接口定义已修改',
+  changes: '变更清单或评审结论已变化',
+  exemptions: '豁免记录已变化',
 };
 
 export function classifyChange(input: {
@@ -218,4 +264,54 @@ export function validateForRelease(contract: ApiContract): ReleaseIssue[] {
     });
 
   return issues;
+}
+
+/**
+ * 发布候选的工作副本指纹：
+ * 接口定义、变更（含评审结论）和豁免记录中任一部分变化，指纹都会改变。
+ */
+export interface CandidateFingerprint {
+  work: string;
+  openapi: string;
+}
+
+export function computeCandidateFingerprint(
+  contract: Pick<ApiContract, 'openapi' | 'changes' | 'exemptions'>,
+): CandidateFingerprint {
+  // stableChecksum 仅用于 localStorage 本地数据一致性校验，不参与安全场景
+  const openapi = stableChecksum(contract.openapi);
+  const changes = stableChecksum(JSON.stringify(contract.changes));
+  const exemptions = stableChecksum(JSON.stringify(contract.exemptions));
+  return { openapi, work: stableChecksum(`${openapi}|${changes}|${exemptions}`) };
+}
+
+/** 返回候选与当前工作副本不一致的部分；一致时返回空数组。 */
+export function getCandidateDrift(
+  candidate: ReleaseCandidate,
+  contract: Pick<ApiContract, 'openapi' | 'changes' | 'exemptions'>,
+): CandidateDriftKind[] {
+  const fingerprint = computeCandidateFingerprint(contract);
+  if (fingerprint.work === candidate.workFingerprint) return [];
+  const drift: CandidateDriftKind[] = [];
+  if (fingerprint.openapi !== candidate.openapiFingerprint) drift.push('openapi');
+  if (stableChecksum(JSON.stringify(contract.changes)) !== stableChecksum(JSON.stringify(candidate.changes))) {
+    drift.push('changes');
+  }
+  if (
+    stableChecksum(JSON.stringify(contract.exemptions)) !==
+    stableChecksum(JSON.stringify(candidate.exemptions))
+  ) {
+    drift.push('exemptions');
+  }
+  return drift;
+}
+
+/** 冻结/废弃状态由记录本身决定；仍处于就绪态的候选需要实时对照工作副本。 */
+export function getEffectiveCandidateStatus(
+  candidate: ReleaseCandidate,
+  contract?: Pick<ApiContract, 'openapi' | 'changes' | 'exemptions'>,
+): CandidateStatus {
+  if (candidate.status === 'frozen' || candidate.status === 'discarded') return candidate.status;
+  if (!contract) return candidate.status;
+  return getCandidateDrift(candidate, contract).length ? 'stale' : 'ready';
 }

@@ -3,7 +3,9 @@ import type { ReviewState } from '../models/contract';
 import {
   addExemption,
   bulkReviewChanges,
-  freezeVersion,
+  createReleaseCandidate,
+  discardReleaseCandidate,
+  freezeCandidate,
   getContract,
   listContracts,
   reviewChange,
@@ -97,11 +99,29 @@ export function useAddExemption() {
   });
 }
 
-export function useFreezeVersion() {
+export function useCreateCandidate() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (input: { contractId: string; version: string; notes: string }) =>
-      freezeVersion(input.contractId, input.version, input.notes),
+      createReleaseCandidate(input.contractId, input.version, input.notes),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: contractKeys.all }),
+  });
+}
+
+export function useDiscardCandidate() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { contractId: string; candidateId: string }) =>
+      discardReleaseCandidate(input.contractId, input.candidateId),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: contractKeys.all }),
+  });
+}
+
+export function useFreezeCandidate() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { contractId: string; candidateId: string }) =>
+      freezeCandidate(input.contractId, input.candidateId),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: contractKeys.all }),
   });
 }

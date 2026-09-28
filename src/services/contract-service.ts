@@ -3,15 +3,29 @@ import type {
   ApiContract,
   ContractChange,
   ContractVersion,
+  ReleaseCandidate,
   ReviewState,
 } from '../models/contract';
-import { stableChecksum, formatDateTime } from '../lib/utils';
+import { computeCandidateFingerprint, validateForRelease } from '../models/contract';
+import { formatDateTime } from '../lib/utils';
 
 const STORAGE_KEY = 'pair-wise-gsb-70-contracts';
 const LATENCY = 180;
 
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+/** 兼容旧版 localStorage 数据：补齐候选字段与历史版本的候选溯源信息。 */
+function normalize(contract: ApiContract): ApiContract {
+  return {
+    ...contract,
+    candidates: Array.isArray(contract.candidates) ? contract.candidates : [],
+    versions: contract.versions.map((release) => ({
+      ...release,
+      changeIds: release.changeIds ?? [],
+    })),
+  };
 }
 
 async function wait(): Promise<void> {
@@ -23,7 +37,8 @@ export async function listContracts(): Promise<ApiContract[]> {
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored) {
     try {
-      return JSON.parse(stored) as ApiContract[];
+      const parsed = JSON.parse(stored) as ApiContract[];
+      return parsed.map(normalize);
     } catch {
       localStorage.removeItem(STORAGE_KEY);
     }
@@ -158,7 +173,7 @@ export async function addExemption(
   return clone(updated);
 }
 
-export async function freezeVersion(
+export async function createReleaseCandidate(
   contractId: string,
   version: string,
   notes: string,
@@ -169,21 +184,129 @@ export async function freezeVersion(
     throw new Error('契约不存在');
   }
 
-  const release: ContractVersion = {
-    id: `ver-${Date.now()}`,
-    contractId,
-    version,
-    releasedAt: new Date().toISOString(),
-    checksum: stableChecksum(contract.openapi),
-    notes,
-    changeIds: contract.changes.map((change) => change.id),
+  const issues = validateForRelease(contract);
+  const blockers = issues.filter((issue) => issue.severity === 'blocker');
+  if (blockers.length) {
+    throw new Error(`发布门禁未通过：${blockers[0].title}`);
+  }
+  const targetVersion = version.trim();
+  if (contract.versions.some((release) => release.version === targetVersion)) {
+    throw new Error(`版本 v${targetVersion} 已存在，请使用新的版本号`);
+  }
+  if (
+    contract.candidates.some(
+      (candidate) =>
+        candidate.version === targetVersion &&
+        candidate.status !== 'discarded' &&
+        candidate.status !== 'frozen',
+    )
+  ) {
+    throw new Error(`已存在版本 v${targetVersion} 的有效候选`);
+  }
+
+  const fingerprint = computeCandidateFingerprint(contract);
+  const candidate: ReleaseCandidate = {
+    id: `rc-${Date.now()}`,
+    version: targetVersion,
+    notes: notes.trim() || '契约兼容性评审完成，生成发布候选。',
+    createdAt: new Date().toISOString(),
+    createdBy: '当前发布人',
+    status: 'ready',
+    warningsCount: issues.filter((issue) => issue.severity === 'warning').length,
+    openapiChecksum: fingerprint.openapi,
+    workFingerprint: fingerprint.work,
+    openapiFingerprint: fingerprint.openapi,
+    changes: clone(contract.changes),
+    exemptions: clone(contract.exemptions),
     openapi: contract.openapi,
   };
   const updated: ApiContract = {
     ...contract,
-    version,
+    candidates: [candidate, ...contract.candidates],
+  };
+  persistContracts(contracts.map((item) => (item.id === contractId ? updated : item)));
+  await wait();
+  return clone(updated);
+}
+
+export async function discardReleaseCandidate(
+  contractId: string,
+  candidateId: string,
+): Promise<ApiContract> {
+  const contracts = await listContracts();
+  const contract = contracts.find((item) => item.id === contractId);
+  if (!contract) {
+    throw new Error('契约不存在');
+  }
+  const candidate = contract.candidates.find((item) => item.id === candidateId);
+  if (!candidate) {
+    throw new Error('发布候选不存在');
+  }
+  if (candidate.status === 'frozen') {
+    throw new Error('已冻结的候选不能废弃');
+  }
+  const updated: ApiContract = {
+    ...contract,
+    candidates: contract.candidates.map((item) =>
+      item.id === candidateId
+        ? { ...item, status: 'discarded', discardedAt: new Date().toISOString() }
+        : item,
+    ),
+  };
+  persistContracts(contracts.map((item) => (item.id === contractId ? updated : item)));
+  await wait();
+  return clone(updated);
+}
+
+export async function freezeCandidate(
+  contractId: string,
+  candidateId: string,
+): Promise<ApiContract> {
+  const contracts = await listContracts();
+  const contract = contracts.find((item) => item.id === contractId);
+  if (!contract) {
+    throw new Error('契约不存在');
+  }
+  const candidate = contract.candidates.find((item) => item.id === candidateId);
+  if (!candidate) {
+    throw new Error('发布候选不存在');
+  }
+  if (candidate.status === 'frozen') {
+    throw new Error('该候选已冻结');
+  }
+  if (candidate.status === 'discarded') {
+    throw new Error('该候选已废弃，不能冻结');
+  }
+
+  // 冻结前再次比对工作副本：任何漂移都必须重新生成候选，不能混冻
+  const drift = computeCandidateFingerprint(contract);
+  if (drift.work !== candidate.workFingerprint) {
+    throw new Error('候选已过期：工作副本在候选生成后发生变化，请重新生成候选');
+  }
+
+  const release: ContractVersion = {
+    id: `ver-${Date.now()}`,
+    contractId,
+    version: candidate.version,
+    releasedAt: new Date().toISOString(),
+    checksum: candidate.openapiChecksum,
+    notes: candidate.notes,
+    changeIds: candidate.changes.map((change) => change.id),
+    openapi: candidate.openapi,
+    candidateId: candidate.id,
+    changes: clone(candidate.changes),
+  };
+  const frozenAt = release.releasedAt;
+  const updated: ApiContract = {
+    ...contract,
+    version: candidate.version,
     status: 'frozen',
     versions: [release, ...contract.versions],
+    candidates: contract.candidates.map((item) =>
+      item.id === candidateId
+        ? { ...item, status: 'frozen', frozenVersionId: release.id, frozenAt }
+        : item,
+    ),
   };
   persistContracts(contracts.map((item) => (item.id === contractId ? updated : item)));
   await wait();
@@ -272,17 +395,26 @@ export function buildChangeReport(contract: ApiContract): string {
   return lines.join('\n');
 }
 
-export function diffVersionSummary(contract: ApiContract): string {
-  const previous = contract.versions[0];
-  if (!previous) {
+export function diffVersionSummary(
+  contract: ApiContract,
+  release: ContractVersion | undefined = contract.versions[0],
+): string {
+  if (!release) {
     return '无可比较的历史正式版本。';
   }
-  return [
-    `上一版 ${previous.version}`,
-    `发布于 ${formatDateTime(previous.releasedAt)}`,
-    `校验值 ${previous.checksum}`,
-    `本版变更 ${contract.changes.length} 项`,
-  ].join('\n');
+  const lines = [
+    `版本 v${release.version}`,
+    `发布于 ${formatDateTime(release.releasedAt)}`,
+    `校验值 ${release.checksum}`,
+  ];
+  const candidate = contract.candidates.find((item) => item.id === release.candidateId);
+  if (candidate) {
+    lines.push(
+      `来自发布候选 ${candidate.id}（${formatDateTime(candidate.createdAt)} 生成）`,
+    );
+  }
+  lines.push(`快照变更 ${release.changeIds.length} 项`);
+  return lines.join('\n');
 }
 
 function persistContracts(contracts: ApiContract[]): void {

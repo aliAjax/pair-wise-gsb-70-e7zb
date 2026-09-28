@@ -1,10 +1,9 @@
 import { Link } from '@tanstack/react-router';
-import { Archive, CheckCircle2, LockKeyhole, PackageCheck, TriangleAlert } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { Archive, GitCommit, PackageCheck, LockKeyhole } from 'lucide-react';
+import { useCallback, useMemo } from 'react';
+import { ReleaseCandidatePanel } from '../components/release/release-candidate-panel';
 import { Badge } from '../components/ui/badge';
-import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
-import { Input } from '../components/ui/input';
 import {
   Select,
   SelectContent,
@@ -12,25 +11,24 @@ import {
   SelectTrigger,
   SelectValue,
 } from '../components/ui/select';
-import { Textarea } from '../components/ui/textarea';
 import { formatDateTime } from '../lib/utils';
-import { validateForRelease } from '../models/contract';
-import { useContracts, useFreezeVersion } from '../services/contract-queries';
+import {
+  CHANGE_KIND_LABELS,
+  type ApiContract,
+  type ContractChange,
+  type ContractVersion,
+} from '../models/contract';
+import { useContracts } from '../services/contract-queries';
 import { useReviewStore } from '../store/review-store';
 
 export function ReleasesPage() {
   const contracts = useContracts();
-  const freezeVersion = useFreezeVersion();
   const selectedContractId = useReviewStore((state) => state.selectedContractId);
   const setSelectedContract = useReviewStore((state) => state.setSelectedContract);
-  const [version, setVersion] = useState('');
-  const [notes, setNotes] = useState('');
 
   const selectedContract = (contracts.data ?? []).find(
     (contract) => contract.id === selectedContractId,
   );
-  const selectedIssues = selectedContract ? validateForRelease(selectedContract) : [];
-  const blockers = selectedIssues.filter((issue) => issue.severity === 'blocker').length;
 
   const versions = useMemo(
     () =>
@@ -46,16 +44,11 @@ export function ReleasesPage() {
     [contracts.data],
   );
 
-  async function freeze() {
-    if (!selectedContract || !version.trim() || blockers) return;
-    await freezeVersion.mutateAsync({
-      contractId: selectedContract.id,
-      version: version.trim(),
-      notes: notes.trim() || '契约兼容性评审完成，正式冻结。',
-    });
-    setVersion('');
-    setNotes('');
-  }
+  const suggestVersion = useCallback((current: string): string => {
+    const parts = current.split('.').map(Number);
+    if (parts.length !== 3 || parts.some(Number.isNaN)) return current;
+    return `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
+  }, []);
 
   return (
     <div>
@@ -65,11 +58,12 @@ export function ReleasesPage() {
           契约版本发布
         </h1>
         <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-600">
-          只有逐条评审完成且迁移约束满足后，才能冻结正式版本。版本快照会记录校验值并保留历史比较能力。
+          门禁通过后先生成发布候选：版本号、校验值、发布说明和已确认变更在候选中固化为不可变快照。
+          工作副本再被修改时候选立即标记为已过期，不能冻结，只能重新生成。
         </p>
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
+      <div className="grid gap-4 xl:grid-cols-[1fr_400px]">
         <Card>
           <CardHeader>
             <CardTitle>正式版本记录</CardTitle>
@@ -77,44 +71,22 @@ export function ReleasesPage() {
           </CardHeader>
           <CardContent className="p-0">
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[760px] text-left text-sm">
+              <table className="w-full min-w-[920px] text-left text-sm">
                 <thead className="bg-slate-50 text-xs text-slate-500">
                   <tr>
                     <th className="px-4 py-3 font-medium">契约</th>
                     <th className="px-4 py-3 font-medium">版本</th>
                     <th className="px-4 py-3 font-medium">发布时间</th>
                     <th className="px-4 py-3 font-medium">校验值</th>
+                    <th className="px-4 py-3 font-medium">来源候选</th>
+                    <th className="px-4 py-3 font-medium">已确认变更</th>
                     <th className="px-4 py-3 font-medium">发布说明</th>
                     <th className="px-4 py-3 font-medium" />
                   </tr>
                 </thead>
                 <tbody>
                   {versions.map(({ contract, release }) => (
-                    <tr key={release.id} className="border-t border-slate-100">
-                      <td className="px-4 py-4">
-                        <div className="font-medium">{contract.name}</div>
-                        <div className="mt-1 text-xs text-slate-500">{contract.domain}</div>
-                      </td>
-                      <td className="px-4 py-4">
-                        <Badge tone="slate">v{release.version}</Badge>
-                      </td>
-                      <td className="px-4 py-4 text-slate-600">
-                        {formatDateTime(release.releasedAt)}
-                      </td>
-                      <td className="px-4 py-4 font-mono text-xs text-slate-600">
-                        {release.checksum}
-                      </td>
-                      <td className="max-w-md px-4 py-4 text-slate-600">{release.notes}</td>
-                      <td className="px-4 py-4 text-right">
-                        <Link
-                          to="/contracts/$contractId"
-                          params={{ contractId: contract.id }}
-                          className="text-xs font-medium text-sky-800 hover:underline"
-                        >
-                          查看版本
-                        </Link>
-                      </td>
-                    </tr>
+                    <ReleaseRow key={release.id} contract={contract} release={release} />
                   ))}
                 </tbody>
               </table>
@@ -130,17 +102,15 @@ export function ReleasesPage() {
         <div className="space-y-4">
           <Card>
             <CardHeader>
-              <CardTitle>选择发布候选</CardTitle>
-              <p className="mt-1 text-xs text-slate-500">发布门禁会实时检查当前工作副本</p>
+              <CardTitle>发布候选</CardTitle>
+              <p className="mt-1 text-xs text-slate-500">
+                选择契约，门禁通过后生成不可变快照并从候选冻结
+              </p>
             </CardHeader>
             <CardContent>
               <Select
                 value={selectedContractId}
-                onValueChange={(value) => {
-                  setSelectedContract(value);
-                  const contract = (contracts.data ?? []).find((item) => item.id === value);
-                  if (contract) setVersion(suggestVersion(contract.version));
-                }}
+                onValueChange={(value) => setSelectedContract(value)}
               >
                 <SelectTrigger className="w-full">
                   <SelectValue placeholder="选择一个契约" />
@@ -154,56 +124,18 @@ export function ReleasesPage() {
                 </SelectContent>
               </Select>
 
-              {selectedContract && (
-                <div className="mt-4">
-                  <div
-                    className={
-                      blockers
-                        ? 'flex items-start gap-3 rounded-md border border-red-200 bg-red-50 p-3'
-                        : 'flex items-start gap-3 rounded-md border border-emerald-200 bg-emerald-50 p-3'
-                    }
-                  >
-                    {blockers ? (
-                      <TriangleAlert className="mt-0.5 h-4 w-4 text-red-700" />
-                    ) : (
-                      <CheckCircle2 className="mt-0.5 h-4 w-4 text-emerald-700" />
-                    )}
-                    <div>
-                      <strong className="text-sm">
-                        {blockers ? `${blockers} 个阻断项` : '发布门禁通过'}
-                      </strong>
-                      <p className="mt-1 text-xs leading-5 text-slate-600">
-                        {blockers
-                          ? '先在详细页补齐改变评审、影响说明和迁移方案。'
-                          : '可以冻结正式版本，历史工作副本仍保留。'}
-                      </p>
-                    </div>
-                  </div>
-
-                  <label className="mt-4 block text-xs font-medium text-slate-700">新版本号</label>
-                  <Input
-                    className="mt-1.5"
-                    value={version}
-                    onChange={(event) => setVersion(event.target.value)}
-                    placeholder="2.9.0"
+              <div className="mt-4">
+                {selectedContract ? (
+                  <ReleaseCandidatePanel
+                    contract={selectedContract}
+                    suggestVersion={suggestVersion}
                   />
-                  <label className="mt-4 block text-xs font-medium text-slate-700">发布说明</label>
-                  <Textarea
-                    className="mt-1.5"
-                    value={notes}
-                    onChange={(event) => setNotes(event.target.value)}
-                    placeholder="版本变化、兼容层和调用方升级状态"
-                  />
-                  <Button
-                    className="mt-4 w-full"
-                    disabled={!!blockers || !version.trim() || freezeVersion.isPending}
-                    onClick={() => void freeze()}
-                  >
-                    <LockKeyhole className="h-4 w-4" />
-                    {freezeVersion.isPending ? '冻结中' : '冻结正式版本'}
-                  </Button>
-                </div>
-              )}
+                ) : (
+                  <p className="rounded-md border border-dashed border-slate-200 px-3 py-10 text-center text-xs text-slate-500">
+                    请先选择一个契约。
+                  </p>
+                )}
+              </div>
             </CardContent>
           </Card>
 
@@ -212,9 +144,10 @@ export function ReleasesPage() {
               <CardTitle>冻结策略</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4 text-sm text-slate-600">
-              <Policy icon={Archive} text="版本快照包含完整 OpenAPI 和变更清单。" />
-              <Policy icon={PackageCheck} text="新版本发布不会覆盖旧版记录。" />
-              <Policy icon={LockKeyhole} text="冻结后通过差异编辑器与当前工作副本比较。" />
+              <Policy icon={Archive} text="候选快照固化接口定义、校验值、发布说明和已确认变更。" />
+              <Policy icon={GitCommit} text="工作副本一旦改动，候选自动标记过期且禁止冻结。" />
+              <Policy icon={PackageCheck} text="正式版本记录来源候选，历史不会被后续编辑覆盖。" />
+              <Policy icon={LockKeyhole} text="候选与版本均持久化保存，关闭浏览器后仍然保留。" />
             </CardContent>
           </Card>
         </div>
@@ -223,10 +156,85 @@ export function ReleasesPage() {
   );
 }
 
-function suggestVersion(current: string): string {
-  const parts = current.split('.').map(Number);
-  if (parts.length !== 3 || parts.some(Number.isNaN)) return current;
-  return `${parts[0]}.${parts[1]}.${parts[2] + 1}`;
+function ReleaseRow({ contract, release }: { contract: ApiContract; release: ContractVersion }) {
+  const changes = resolveReleaseChanges(contract, release);
+  const candidate = contract.candidates.find((item) => item.id === release.candidateId);
+  return (
+    <tr className="border-t border-slate-100 align-top">
+      <td className="px-4 py-4">
+        <div className="font-medium">{contract.name}</div>
+        <div className="mt-1 text-xs text-slate-500">{contract.domain}</div>
+      </td>
+      <td className="px-4 py-4">
+        <Badge tone="slate">v{release.version}</Badge>
+      </td>
+      <td className="whitespace-nowrap px-4 py-4 text-slate-600">
+        {formatDateTime(release.releasedAt)}
+      </td>
+      <td className="px-4 py-4 font-mono text-xs text-slate-600">{release.checksum}</td>
+      <td className="px-4 py-4">
+        {candidate ? (
+          <div>
+            <Badge tone="green">候选</Badge>
+            <p className="mt-1 font-mono text-[10px] text-slate-500">{candidate.id}</p>
+            <p className="mt-0.5 text-[10px] text-slate-400">
+              {formatDateTime(candidate.createdAt)} 生成
+            </p>
+          </div>
+        ) : (
+          <span className="text-xs text-slate-400">候选机制前版本</span>
+        )}
+      </td>
+      <td className="px-4 py-4">
+        <ChangeSummary changes={changes} />
+      </td>
+      <td className="max-w-xs px-4 py-4 text-slate-600">
+        <p className="line-clamp-3">{release.notes}</p>
+      </td>
+      <td className="whitespace-nowrap px-4 py-4 text-right">
+        <Link
+          to="/contracts/$contractId"
+          params={{ contractId: contract.id }}
+          className="text-xs font-medium text-sky-800 hover:underline"
+        >
+          查看版本
+        </Link>
+      </td>
+    </tr>
+  );
+}
+
+function ChangeSummary({ changes }: { changes: ContractChange[] }) {
+  if (!changes.length) {
+    return <span className="text-xs text-slate-400">无变更快照</span>;
+  }
+  return (
+    <div>
+      <strong className="text-xs">{changes.length} 项</strong>
+      <ul className="mt-1 space-y-0.5">
+        {changes.slice(0, 2).map((change) => (
+          <li key={change.id} className="text-[10px] leading-4 text-slate-500">
+            <span className="font-mono">{change.method}</span> {change.path} ·{' '}
+            {CHANGE_KIND_LABELS[change.kind]}
+          </li>
+        ))}
+        {changes.length > 2 && (
+          <li className="text-[10px] text-slate-400">其余 {changes.length - 2} 项见详情</li>
+        )}
+      </ul>
+    </div>
+  );
+}
+
+/** 新版本直接携带候选变更快照；旧数据则从当前契约按 id 回溯。 */
+function resolveReleaseChanges(
+  contract: ApiContract,
+  release: ContractVersion,
+): ContractChange[] {
+  if (release.changes?.length) return release.changes;
+  return release.changeIds
+    .map((id) => contract.changes.find((change) => change.id === id))
+    .filter((change): change is ContractChange => Boolean(change));
 }
 
 function Policy({

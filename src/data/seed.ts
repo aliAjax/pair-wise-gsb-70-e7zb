@@ -219,6 +219,7 @@ export const seedContracts: ApiContract[] = [
         openapi: orderOpenApi.replaceAll('2.8.0', '2.7.0'),
       },
     ],
+    candidates: [],
   },
   {
     id: 'contract-payment',
@@ -297,6 +298,7 @@ export const seedContracts: ApiContract[] = [
         openapi: paymentOpenApi.replaceAll('4.2.0', '4.1.0'),
       },
     ],
+    candidates: [],
   },
   {
     id: 'contract-user',
@@ -337,5 +339,6 @@ export const seedContracts: ApiContract[] = [
     ],
     exemptions: [],
     versions: [],
+    candidates: [],
   },
 ];
