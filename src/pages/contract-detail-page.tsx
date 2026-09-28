@@ -6,9 +6,10 @@ import {
   Clock3,
   Download,
   FileWarning,
+  GitBranch,
+  GitCommitHorizontal,
   GitCompare,
   Layers3,
-  LockKeyhole,
   Users,
 } from 'lucide-react';
 import { useMemo, useState } from 'react';
@@ -16,10 +17,10 @@ import { ChangeReviewItem } from '../components/contract/change-review-item';
 import { CompatibilityBadge } from '../components/contract/compatibility-badge';
 import { ConsumerTable } from '../components/contract/consumer-table';
 import { ContractEditor } from '../components/contract/contract-editor';
+import { ReleaseCandidatePanel } from '../components/contract/release-candidate-panel';
 import { Badge } from '../components/ui/badge';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
-import { Input } from '../components/ui/input';
 import { Progress } from '../components/ui/progress';
 import {
   Select,
@@ -29,9 +30,9 @@ import {
   SelectValue,
 } from '../components/ui/select';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs';
-import { Textarea } from '../components/ui/textarea';
 import { formatDateTime } from '../lib/utils';
 import {
+  CHANGE_KIND_LABELS,
   REVIEW_STATE_LABELS,
   type ApiContract,
   type ContractChange,
@@ -46,7 +47,6 @@ import {
 import {
   useAddExemption,
   useContract,
-  useFreezeVersion,
   useReviewChange,
   useSaveContract,
   useUpdateOpenApi,
@@ -62,9 +62,6 @@ export function ContractDetailPage() {
   const addExemption = useAddExemption();
   const updateOpenApi = useUpdateOpenApi();
   const saveContract = useSaveContract();
-  const freezeVersion = useFreezeVersion();
-  const [releaseVersion, setReleaseVersion] = useState('');
-  const [releaseNotes, setReleaseNotes] = useState('');
   const [reviewFilter, setReviewFilter] = useState<ReviewState | 'all'>('all');
   const [selectedVersionId, setSelectedVersionId] = useState('');
 
@@ -125,17 +122,6 @@ export function ContractDetailPage() {
 
   async function saveOpenApi(value: string) {
     await updateOpenApi.mutateAsync({ contractId, openapi: value });
-  }
-
-  async function freeze() {
-    if (!releaseVersion.trim()) return;
-    await freezeVersion.mutateAsync({
-      contractId,
-      version: releaseVersion.trim(),
-      notes: releaseNotes.trim() || '本版契约变更评审完成。',
-    });
-    setReleaseVersion('');
-    setReleaseNotes('');
   }
 
   function exportReport() {
@@ -326,7 +312,7 @@ export function ContractDetailPage() {
         </TabsContent>
 
         <TabsContent value="release">
-          <div className="grid gap-4 xl:grid-cols-[1fr_380px]">
+          <div className="grid gap-4 xl:grid-cols-[1fr_400px]">
             <Card>
               <CardHeader>
                 <CardTitle>发布前门禁</CardTitle>
@@ -357,44 +343,13 @@ export function ContractDetailPage() {
                 ))}
                 {!issues.length && (
                   <div className="rounded-md border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-900">
-                    所有变更评审和迁移约束均已满足，可以冻结正式版本。
+                    所有变更评审和迁移约束均已满足，可以生成发布候选并冻结正式版本。
                   </div>
                 )}
               </CardContent>
             </Card>
 
-            <Card>
-              <CardHeader>
-                <CardTitle>冻结正式版本</CardTitle>
-                <p className="mt-1 text-xs text-slate-500">
-                  冻结后版本定义不可覆盖，并保留校验值
-                </p>
-              </CardHeader>
-              <CardContent>
-                <label className="text-xs font-medium text-slate-700">版本号</label>
-                <Input
-                  className="mt-1.5"
-                  value={releaseVersion}
-                  onChange={(event) => setReleaseVersion(event.target.value)}
-                  placeholder="例如 2.9.0"
-                />
-                <label className="mt-4 block text-xs font-medium text-slate-700">发布说明</label>
-                <Textarea
-                  className="mt-1.5"
-                  value={releaseNotes}
-                  onChange={(event) => setReleaseNotes(event.target.value)}
-                  placeholder="说明本版接口变化、兼容层和调用方升级状态"
-                />
-                <Button
-                  className="mt-4 w-full"
-                  disabled={!!blockers || !releaseVersion.trim() || freezeVersion.isPending}
-                  onClick={() => void freeze()}
-                >
-                  <LockKeyhole className="h-4 w-4" />
-                  {freezeVersion.isPending ? '冻结中' : '确认发布并冻结'}
-                </Button>
-              </CardContent>
-            </Card>
+            <ReleaseCandidatePanel contract={contract} />
           </div>
         </TabsContent>
 
@@ -431,31 +386,44 @@ export function ContractDetailPage() {
                   )}
                 </CardContent>
               </Card>
-              <Card>
-                <CardHeader>
-                  <CardTitle>与当前工作副本比较</CardTitle>
-                  <p className="mt-1 whitespace-pre-line text-xs text-slate-500">
-                    {diffVersionSummary(contract)}
-                  </p>
-                </CardHeader>
-                <CardContent>
-                  <div className="overflow-hidden rounded-md border border-slate-200">
-                    <DiffEditor
-                      height="520px"
-                      language="plaintext"
-                      original={selectedVersion.openapi}
-                      modified={contract.openapi}
-                      options={{
-                        readOnly: true,
-                        minimap: { enabled: false },
-                        renderSideBySide: true,
-                        fontSize: 12,
-                        automaticLayout: true,
-                      }}
-                    />
-                  </div>
-                </CardContent>
-              </Card>
+              <div className="space-y-4">
+                <Card>
+                  <CardHeader>
+                    <CardTitle>v{selectedVersion.version} 版本来源</CardTitle>
+                    <p className="mt-1 text-xs text-slate-500">
+                      发布时间 {formatDateTime(selectedVersion.releasedAt)}
+                    </p>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <VersionProvenance contract={contract} versionId={selectedVersion.id} />
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle>与当前工作副本比较</CardTitle>
+                    <p className="mt-1 whitespace-pre-line text-xs text-slate-500">
+                      {diffVersionSummary(contract)}
+                    </p>
+                  </CardHeader>
+                  <CardContent>
+                    <div className="overflow-hidden rounded-md border border-slate-200">
+                      <DiffEditor
+                        height="420px"
+                        language="plaintext"
+                        original={selectedVersion.openapi}
+                        modified={contract.openapi}
+                        options={{
+                          readOnly: true,
+                          minimap: { enabled: false },
+                          renderSideBySide: true,
+                          fontSize: 12,
+                          automaticLayout: true,
+                        }}
+                      />
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
             </div>
           ) : (
             <Card>
@@ -579,6 +547,80 @@ function ReportFact({
       </span>
       <strong>{value}</strong>
     </div>
+  );
+}
+
+function VersionProvenance({
+  contract,
+  versionId,
+}: {
+  contract: ApiContract;
+  versionId: string;
+}) {
+  const release = contract.versions.find((item) => item.id === versionId);
+  if (!release) return null;
+  const candidate = contract.candidates.find((item) => item.id === release.candidateId);
+  const changes = release.changes ?? [];
+
+  return (
+    <>
+      <div className="rounded-md border border-slate-200 bg-slate-50 p-3 text-xs leading-6 text-slate-600">
+        <p className="flex items-center gap-1.5 font-semibold text-slate-700">
+          <GitBranch className="h-3.5 w-3.5 text-sky-800" />
+          来源候选
+        </p>
+        {candidate ? (
+          <div className="mt-1.5">
+            <p>
+              由发布候选 <strong>v{candidate.version}</strong>（{candidate.id}）冻结
+            </p>
+            <p>候选生成于 {formatDateTime(candidate.createdAt)}</p>
+            <p className="font-mono text-[11px] text-slate-500">
+              候选校验值 {candidate.checksum}
+              {candidate.checksum === release.checksum ? ' · 与冻结版本一致' : ' · 与冻结版本不一致'}
+            </p>
+          </div>
+        ) : (
+          <p className="mt-1.5 text-slate-500">
+            该版本在候选机制上线前冻结，无来源候选记录。
+          </p>
+        )}
+      </div>
+
+      <div>
+        <p className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+          <GitCommitHorizontal className="h-3.5 w-3.5 text-sky-800" />
+          本版所含变更（{changes.length} 项，取自冻结时刻的候选快照）
+        </p>
+        {changes.length ? (
+          <ul className="mt-2 space-y-2">
+            {changes.map((change) => (
+              <li
+                key={change.id}
+                className="rounded-md border border-slate-200 px-3 py-2 text-xs leading-5 text-slate-600"
+              >
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono text-slate-800">
+                    {change.method} {change.path}
+                  </span>
+                  <span>{CHANGE_KIND_LABELS[change.kind]}</span>
+                  <CompatibilityBadge value={change.compatibility} />
+                </div>
+                <p className="mt-1">变更前：{change.before}</p>
+                <p>变更后：{change.after}</p>
+                <p className="text-slate-500">
+                  评审：{REVIEW_STATE_LABELS[change.reviewState]}
+                  {change.reviewer ? ` · ${change.reviewer}` : ''}
+                  {change.reviewComment ? ` · ${change.reviewComment}` : ''}
+                </p>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="mt-2 text-xs text-slate-400">该版本未记录变更项。</p>
+        )}
+      </div>
+    </>
   );
 }
 

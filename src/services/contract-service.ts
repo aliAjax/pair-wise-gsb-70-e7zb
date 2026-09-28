@@ -3,7 +3,13 @@ import type {
   ApiContract,
   ContractChange,
   ContractVersion,
+  ReleaseCandidate,
   ReviewState,
+} from '../models/contract';
+import {
+  selectConfirmedChanges,
+  validateForRelease,
+  workingCopyFingerprint,
 } from '../models/contract';
 import { stableChecksum, formatDateTime } from '../lib/utils';
 
@@ -23,13 +29,24 @@ export async function listContracts(): Promise<ApiContract[]> {
   const stored = localStorage.getItem(STORAGE_KEY);
   if (stored) {
     try {
-      return JSON.parse(stored) as ApiContract[];
+      const parsed = JSON.parse(stored) as ApiContract[];
+      const normalized = parsed.map(migrateContract);
+      return normalized;
     } catch {
       localStorage.removeItem(STORAGE_KEY);
     }
   }
   persistContracts(seedContracts);
   return clone(seedContracts);
+}
+
+/** 兼容旧版本本地数据：补齐发布候选字段。 */
+function migrateContract(contract: ApiContract): ApiContract {
+  return {
+    ...contract,
+    candidates: contract.candidates ?? [],
+    versions: contract.versions ?? [],
+  };
 }
 
 export async function getContract(id: string): Promise<ApiContract | undefined> {
@@ -158,32 +175,131 @@ export async function addExemption(
   return clone(updated);
 }
 
-export async function freezeVersion(
+/**
+ * 生成发布候选：门禁通过后对当前工作副本打不可变快照。
+ * 快照记录版本号、校验值、发布说明和已确认的变更。
+ */
+export async function createReleaseCandidate(input: {
+  contractId: string;
+  version: string;
+  notes: string;
+}): Promise<ApiContract> {
+  const contracts = await listContracts();
+  const contract = contracts.find((item) => item.id === input.contractId);
+  if (!contract) {
+    throw new Error('契约不存在');
+  }
+
+  const blockers = validateForRelease(contract).filter(
+    (issue) => issue.severity === 'blocker',
+  );
+  if (blockers.length) {
+    throw new Error(`发布门禁仍有 ${blockers.length} 个阻断项，不能生成候选。`);
+  }
+  const version = input.version.trim();
+  if (contract.versions.some((release) => release.version === version)) {
+    throw new Error(`版本 v${version} 已存在，请使用新的版本号。`);
+  }
+  if (
+    contract.candidates.some(
+      (candidate) => !candidate.frozenVersionId && candidate.version === version,
+    )
+  ) {
+    throw new Error(`已有未冻结的候选 v${version}。`);
+  }
+
+  const confirmed = selectConfirmedChanges(contract.changes);
+  const candidate: ReleaseCandidate = {
+    id: `rc-${Date.now()}`,
+    contractId: input.contractId,
+    version,
+    notes: input.notes.trim(),
+    createdAt: new Date().toISOString(),
+    checksum: stableChecksum(contract.openapi),
+    workingFingerprint: workingCopyFingerprint(contract.openapi, contract.changes),
+    gateIssues: validateForRelease(contract),
+    openapi: contract.openapi,
+    changes: clone(confirmed),
+  };
+  const updated: ApiContract = {
+    ...contract,
+    status: 'ready',
+    candidates: [candidate, ...contract.candidates],
+  };
+  persistContracts(contracts.map((item) => (item.id === input.contractId ? updated : item)));
+  await wait();
+  return clone(updated);
+}
+
+/** 废弃未冻结的候选。 */
+export async function discardReleaseCandidate(
   contractId: string,
-  version: string,
-  notes: string,
+  candidateId: string,
 ): Promise<ApiContract> {
   const contracts = await listContracts();
   const contract = contracts.find((item) => item.id === contractId);
   if (!contract) {
     throw new Error('契约不存在');
   }
+  const updated: ApiContract = {
+    ...contract,
+    candidates: contract.candidates.filter((candidate) => candidate.id !== candidateId),
+  };
+  persistContracts(contracts.map((item) => (item.id === contractId ? updated : item)));
+  await wait();
+  return clone(updated);
+}
+
+/**
+ * 基于发布候选冻结正式版本。版本内容（OpenAPI、变更清单、校验值）全部取自
+ * 候选快照而非实时工作副本；候选一旦过期（工作副本被改动）即拒绝冻结。
+ */
+export async function freezeFromCandidate(
+  contractId: string,
+  candidateId: string,
+): Promise<ApiContract> {
+  const contracts = await listContracts();
+  const contract = contracts.find((item) => item.id === contractId);
+  if (!contract) {
+    throw new Error('契约不存在');
+  }
+  const candidate = contract.candidates.find((item) => item.id === candidateId);
+  if (!candidate) {
+    throw new Error('发布候选不存在，请重新生成。');
+  }
+  if (candidate.frozenVersionId) {
+    throw new Error('该候选已经冻结为正式版本。');
+  }
+  if (
+    workingCopyFingerprint(contract.openapi, contract.changes) !==
+    candidate.workingFingerprint
+  ) {
+    throw new Error('候选已过期：生成后工作副本又被修改，请废弃后基于最新内容重新生成。');
+  }
+  if (contract.versions.some((release) => release.version === candidate.version)) {
+    throw new Error(`版本 v${candidate.version} 已存在，请调整候选版本号。`);
+  }
 
   const release: ContractVersion = {
     id: `ver-${Date.now()}`,
     contractId,
-    version,
+    version: candidate.version,
     releasedAt: new Date().toISOString(),
-    checksum: stableChecksum(contract.openapi),
-    notes,
-    changeIds: contract.changes.map((change) => change.id),
-    openapi: contract.openapi,
+    checksum: candidate.checksum,
+    notes: candidate.notes || '契约兼容性评审完成，正式冻结。',
+    changeIds: candidate.changes.map((change) => change.id),
+    openapi: candidate.openapi,
+    candidateId: candidate.id,
+    changes: clone(candidate.changes),
   };
   const updated: ApiContract = {
     ...contract,
-    version,
+    version: candidate.version,
     status: 'frozen',
     versions: [release, ...contract.versions],
+    candidates: contract.candidates.map((item) =>
+      item.id === candidate.id ? { ...item, frozenVersionId: release.id } : item,
+    ),
   };
   persistContracts(contracts.map((item) => (item.id === contractId ? updated : item)));
   await wait();

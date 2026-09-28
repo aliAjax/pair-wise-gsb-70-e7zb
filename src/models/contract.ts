@@ -1,3 +1,5 @@
+import { stableChecksum } from '../lib/utils';
+
 export type ContractStatus = 'draft' | 'review' | 'ready' | 'released' | 'frozen';
 export type ChangeKind =
   | 'field_added'
@@ -45,6 +47,31 @@ export interface Exemption {
   expiresAt: string;
 }
 
+export interface ReleaseCandidate {
+  id: string;
+  contractId: string;
+  /** 候选拟定的发布版本号 */
+  version: string;
+  /** 发布说明 */
+  notes: string;
+  createdAt: string;
+  /** 候选生成时工作副本 OpenAPI 的校验值 */
+  checksum: string;
+  /**
+   * 候选对工作副本计算的指纹（OpenAPI + 变更评审状态与影响/迁移说明）。
+   * 工作副本再改后指纹不一致，候选即判定为已过期，不能冻结。
+   */
+  workingFingerprint: string;
+  /** 生成候选时门禁结果的快照，仅用于展示 */
+  gateIssues: ReleaseIssue[];
+  /** 不可变快照：完整 OpenAPI 定义 */
+  openapi: string;
+  /** 不可变快照：已确认（非待评审、非退回）的变更 */
+  changes: ContractChange[];
+  /** 生成后被冻结成的正式版本 id；为空表示尚未冻结 */
+  frozenVersionId?: string;
+}
+
 export interface ContractVersion {
   id: string;
   contractId: string;
@@ -54,6 +81,10 @@ export interface ContractVersion {
   notes: string;
   changeIds: string[];
   openapi: string;
+  /** 该版本由哪个发布候选冻结而来 */
+  candidateId?: string;
+  /** 冻结时刻确认的变更快照，正式版本历史据此展示所含变更 */
+  changes?: ContractChange[];
 }
 
 export interface ApiContract {
@@ -70,7 +101,10 @@ export interface ApiContract {
   consumers: ApiConsumer[];
   exemptions: Exemption[];
   versions: ContractVersion[];
+  candidates: ReleaseCandidate[];
 }
+
+export type CandidateStatus = 'active' | 'stale' | 'frozen';
 
 export interface ReleaseIssue {
   id: string;
@@ -219,3 +253,51 @@ export function validateForRelease(contract: ApiContract): ReleaseIssue[] {
 
   return issues;
 }
+
+/** 参与候选快照的变更：评审人已给出结论（接受或兼容层豁免）的变更。 */
+export function selectConfirmedChanges(changes: ContractChange[]): ContractChange[] {
+  return changes.filter(
+    (change) => change.reviewState === 'accepted' || change.reviewState === 'exemption',
+  );
+}
+
+/**
+ * 计算工作副本指纹。评审确认之后只要接口定义或变更结论再被改动
+ * （OpenAPI、评审状态、影响说明、迁移方案、评审意见），指纹就会变化。
+ */
+export function workingCopyFingerprint(
+  openapi: string,
+  changes: ContractChange[],
+): string {
+  const digest = changes.map(
+    (change) =>
+      [
+        change.id,
+        change.reviewState,
+        change.before,
+        change.after,
+        change.impactStatement,
+        change.migrationPlan,
+        change.reviewComment,
+        change.reviewedAt ?? '',
+      ].join(''),
+  );
+  return stableChecksum(`${openapi} ${digest.join('')}`);
+}
+
+export function getCandidateStatus(
+  candidate: ReleaseCandidate,
+  contract: ApiContract,
+): CandidateStatus {
+  if (candidate.frozenVersionId) return 'frozen';
+  return workingCopyFingerprint(contract.openapi, contract.changes) ===
+    candidate.workingFingerprint
+    ? 'active'
+    : 'stale';
+}
+
+export const CANDIDATE_STATUS_LABELS: Record<CandidateStatus, string> = {
+  active: '有效',
+  stale: '已过期',
+  frozen: '已冻结',
+};
